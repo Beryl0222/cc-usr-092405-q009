@@ -63,6 +63,12 @@ ACTIONS = {
     ("artifacts", "register"): "register_artifact",
     ("evaluability", "set"): "set_evaluability",
     ("outcomes", "record"): "record_outcome",
+    # 方案修订（队列扩展）
+    ("amendments", "submit"): "submit_amendment",
+    ("amendments", "review"): "review_amendment",
+    ("amendments", "adopt"): "adopt_amendment",
+    ("amendments", "resolve"): "resolve_subject_amendment",
+    ("amendments", "overdue"): "emergency_amendment_overdue",
 }
 
 # 领域异常类型 -> HTTP 状态（异常自带的 code 作为业务子码原样返回）
@@ -145,7 +151,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = parsed.path.rstrip("/").split("/")
         query = parse_qs(parsed.query)
         try:
-            # /api/subjects[/<id>[/timeline|/provenance]], /api/cohorts, /api/audit
+            # /api/subjects[/<id>[/timeline|/provenance|/actions]], /api/cohorts,
+            # /api/amendments[/<id>[/snapshot]], /api/todos, /api/audit
             if parts[2] == "subjects" and len(parts) == 3:
                 data = REGISTRY.list_subjects(actor)
             elif parts[2] == "subjects" and len(parts) == 4:
@@ -154,8 +161,23 @@ class Handler(BaseHTTPRequestHandler):
                 data = REGISTRY.subject_timeline(actor, parts[3])
             elif len(parts) == 5 and parts[2] == "subjects" and parts[4] == "provenance":
                 data = REGISTRY.subject_provenance(actor, parts[3])
+            elif len(parts) == 5 and parts[2] == "subjects" and parts[4] == "actions":
+                data = REGISTRY.subject_available_actions(actor, parts[3])
             elif parts[2] == "cohorts" and len(parts) == 3:
                 data = REGISTRY.list_cohorts(actor)
+            elif parts[2] == "amendments" and len(parts) == 3:
+                data = REGISTRY.list_amendments(actor)
+            elif parts[2] == "amendments" and len(parts) == 4:
+                data = REGISTRY.get_amendment(actor, parts[3])
+            elif len(parts) == 5 and parts[2] == "amendments" and parts[4] == "snapshot":
+                data = REGISTRY.impact_snapshot(actor, parts[3])
+            elif parts[2] == "todos" and len(parts) == 3:
+                kwargs = {}
+                if "site_id" in query:
+                    kwargs["site_id"] = query["site_id"][0]
+                if "status" in query:
+                    kwargs["status"] = query["status"][0]
+                data = REGISTRY.pending_todos(actor, **kwargs)
             elif parts[2] == "audit" and len(parts) == 3:
                 kwargs = {}
                 if "target_type" in query:

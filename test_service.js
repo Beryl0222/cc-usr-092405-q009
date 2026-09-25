@@ -4,7 +4,7 @@ const { spawnSync } = require("node:child_process");
 
 const result = spawnSync(
   "python3",
-  ["-m", "unittest", "-v", "service_contract", "test_trial", "test_api"],
+  ["-m", "unittest", "-v", "service_contract", "test_trial", "test_amendment", "test_api"],
   { stdio: "inherit" }
 );
 if (result.error) {

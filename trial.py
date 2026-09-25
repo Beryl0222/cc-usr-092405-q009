@@ -46,6 +46,24 @@ DEVIATION_STATUSES = ("待补录原因", "待复核", "安全委员会已复核"
 DECISION_STATUSES = ("继续", "暂停入组", "终止")
 ACTIVITY_OUTCOMES = ("按计划完成", "器械更换", "术期延后", "取消")
 
+# 方案修订（队列扩展阶段）
+AMENDMENT_KINDS = ("常规修订", "紧急安全修订")
+AMENDMENT_STATUSES = ("草拟", "待安全委员会批准", "已批准", "已驳回", "已撤销")
+# 修订可声明的影响域：剂量 / 器械 / 观察窗口 / 安全规则
+IMPACT_DOMAINS = ("剂量", "器械", "观察窗口", "安全规则")
+# 紧急安全修订冻结后补审的最长期限（小时），提交时必须给出不超过该值的期限
+EMERGENCY_REVIEW_DEADLINE_MAX_HOURS = 72
+EMERGENCY_REVIEW_STATUSES = ("待补审", "已补审", "已逾期")
+# 中心对修订的采用状态
+SITE_ADOPTION_STATUSES = ("待采用", "已采用", "已拒绝")
+# 逐受试者处置：继续 / 补充同意 / 重新排程 / 退出
+SUBJECT_DISPOSITIONS = ("继续", "补充同意", "重新排程", "退出")
+REQUIREMENT_ACTIONS = ("重新签署同意", "重新排程")
+# 处置完成（要求闭环）后允许恢复研究操作的受试者状态
+DISPOSITION_RESOLVED = ("继续", "退出")
+# 处置过程中（要求尚未闭环）的受试者状态
+DISPOSITION_PENDING = ("补充同意", "重新排程")
+
 # 治疗前的方案/批次/设备阻断适用于这些活动
 TREATMENT_ACTIVITIES = ("注射", "激光照射")
 # 产生治疗事实的活动：记录实际剂量
@@ -198,6 +216,16 @@ class TrialRegistry:
         self.artifacts: dict[str, dict[str, Any]] = {}
         self.outcomes: dict[str, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
+        # 方案修订（队列扩展阶段）
+        self.amendments: dict[str, dict[str, Any]] = {}
+        self.amendment_order: list[str] = []
+        # amendment_id -> {site_id: adoption 记录}
+        self.site_adoptions: dict[str, dict[str, dict[str, Any]]] = {}
+        # (amendment_id, subject_id) -> disposition 记录
+        self.subject_dispositions: dict[tuple[str, str], dict[str, Any]] = {}
+        # 待办事项（只增，状态迁移）：todo_id -> 记录
+        self.todos: dict[str, dict[str, Any]] = {}
+        self.todo_order: list[str] = []
 
     # ----- 基础工具 ------------------------------------------------------
 
@@ -796,6 +824,7 @@ class TrialRegistry:
             cohort = self._get(self.cohorts, "队列", cohort_id)
             if subject["status"] != "已入组":
                 raise StateConflictError("仅已入组受试者可分配队列")
+            self._amendment_gate(subject)
             if cohort["protocol_id"] != subject["protocol_id"]:
                 raise StateConflictError(
                     f"队列属于方案 {cohort['protocol_version']}，受试者入组方案为 "
@@ -868,6 +897,8 @@ class TrialRegistry:
                     "紧急偏离不能覆盖 SAE 冻结",
                     code="sae_hold",
                 )
+            # 方案修订（含紧急安全修订）冻结未闭环前，不得登记新的紧急偏离规避
+            self._amendment_gate(subject)
             if deviation_type == "治疗中方案偏离" and not target_activity_id:
                 raise ValidationError("治疗中方案偏离必须关联已排程的目标活动")
             aid: Optional[str] = target_activity_id
@@ -1088,6 +1119,21 @@ class TrialRegistry:
         治疗类活动排程即校验：方案放行、中心资质、批次不涉及（执行时校验）、
         SAE 冻结、撤回与越窗。
         """
+        return self._schedule_activity_core(
+            actor, subject_id=subject_id, kind=kind, planned_at=planned_at,
+            activity_id=activity_id,
+        )
+
+    def _schedule_activity_core(
+        self,
+        actor: dict[str, Any],
+        *,
+        subject_id: str,
+        kind: str,
+        planned_at: Any,
+        activity_id: Optional[str] = None,
+        _amendment_bypass: bool = False,
+    ) -> dict[str, Any]:
         actor = self._actor(actor)
         self._require_role(actor, "研究者", "试验协调员")
         if kind not in VISIT_KINDS:
@@ -1099,9 +1145,12 @@ class TrialRegistry:
                 raise StateConflictError("受试者已撤回，不得新增研究活动",
                                          code="subject_withdrawn")
             if kind in TREATMENT_ACTIVITIES:
-                self._treatment_gate(subject, at=planned, for_scheduling=True)
+                self._treatment_gate(subject, at=planned, for_scheduling=True,
+                                     _amendment_bypass=_amendment_bypass)
             else:
                 self._emergency_review_gate(subject_id)
+                if not _amendment_bypass:
+                    self._amendment_gate(subject)
                 if kind in ("手术评估", "影像采集", "病理采集", "访视"):
                     self._window_gate(subject, planned)
             aid = activity_id or _new_id("act")
@@ -1130,11 +1179,13 @@ class TrialRegistry:
 
     def _treatment_gate(
         self, subject: dict[str, Any], *, at: datetime, for_scheduling: bool,
-        check_emergency: bool = True,
+        check_emergency: bool = True, _amendment_bypass: bool = False,
     ) -> None:
         """治疗前阻断规则：错误方案/SAE/撤回/未分配队列一律阻止。
 
         执行紧急偏离的目标活动时由调用方传 check_emergency=False 自行豁免。
+        修订处置中的"重新排程"由调用方传 _amendment_bypass=True 放行修订闸门
+        （此时已在修订流程内、按新版本校验其余规则）。
         """
         sid = subject["subject_id"]
         if subject["withdrawn"]:
@@ -1162,6 +1213,8 @@ class TrialRegistry:
                 "不得安排其他治疗活动",
                 code="emergency_deviation_open",
             )
+        if not _amendment_bypass:
+            self._amendment_gate(subject)
 
     def _window_gate(self, subject: dict[str, Any], at: datetime) -> None:
         window = subject.get("window")
@@ -1231,6 +1284,8 @@ class TrialRegistry:
                         f"存在未复核 SAE {open_sae['sae_id']}，治疗活动冻结",
                         code="sae_hold",
                     )
+                # 方案修订冻结（尤其紧急安全修订）同样不能被受试者级紧急偏离覆盖
+                self._amendment_gate(subject)
                 if emergency is not None:
                     target = emergency.get("target_activity_id")
                     if target is not None and target != activity_id:
@@ -1256,6 +1311,10 @@ class TrialRegistry:
                             code="emergency_deviation_open",
                         )
                     self._treatment_gate(subject, at=at_dt, for_scheduling=False)
+            else:
+                # 非治疗类活动同样受修订闭环与紧急偏离冻结约束
+                self._emergency_review_gate(subject["subject_id"])
+                self._amendment_gate(subject)
 
             # 术期延后：不消耗批次、不构成治疗事实
             if outcome == "术期延后":
@@ -1452,6 +1511,7 @@ class TrialRegistry:
             if record["kind"] in TREATMENT_ACTIVITIES:
                 self._treatment_gate(subject, at=new_at, for_scheduling=True)
             else:
+                self._amendment_gate(subject)
                 self._window_gate(subject, new_at)
             old = record["planned_at"]
             record["planned_at"] = new_at.isoformat(timespec="seconds")
@@ -1499,6 +1559,7 @@ class TrialRegistry:
                     code="research_use_blocked",
                 )
             self._emergency_review_gate(subject_id)
+            self._amendment_gate(subject)
             self._window_gate(subject, captured)
             aid = artifact_id or _new_id("art")
             record = {
@@ -1547,6 +1608,7 @@ class TrialRegistry:
             subject = self._get(self.subjects, "受试者", subject_id)
             if subject["window"] is None:
                 raise StateConflictError("观察窗尚未开启，不能判定可评估性")
+            self._amendment_gate(subject)
             subject["evaluable"] = bool(evaluable)
             subject["evaluable_reason"] = reason
             self._audit_log(actor, "set_evaluability", "subject", subject_id,
@@ -1577,6 +1639,7 @@ class TrialRegistry:
             subject = self._get(self.subjects, "受试者", subject_id)
             at_dt = _parse_dt(at)
             self._emergency_review_gate(subject_id)
+            self._amendment_gate(subject)
             self._window_gate(subject, at_dt)
             if outcome_type == "手术切除评估" and resectable is None:
                 raise ValidationError("手术切除评估必须给出 resectable 结论")
@@ -1635,6 +1698,32 @@ class TrialRegistry:
                          if d["subject_id"] == sid]
         decisions = [d for d in self.decisions
                      if d["target_id"] in (proto["protocol_id"], *sae_ids)]
+        # 影响过该受试者的方案修订（含处置与快照治疗事实），支撑旧版本回溯
+        amendments = []
+        for aid in self.amendment_order:
+            disp = self.subject_dispositions.get((aid, sid))
+            if disp is None:
+                continue
+            amd = self.amendments[aid]
+            row = next((r for r in (amd["impact_snapshot"] or {}).get("subjects", [])
+                        if r["subject_id"] == sid), None)
+            amendments.append({
+                "amendment_id": aid,
+                "kind": amd["kind"],
+                "base_version": amd["base_version"],
+                "new_version": amd["new_version"],
+                "impact_domains": list(amd["impact_domains"]),
+                "requires_reconsent": amd["requires_reconsent"],
+                "status": amd["status"],
+                "recommendation": disp["recommendation"],
+                "decision": disp["decision"],
+                "final_decision": disp.get("final_decision"),
+                "disposition_status": disp["status"],
+                "reconsent_id": disp.get("reconsent_id"),
+                "reschedule_activity_ids": list(disp.get("reschedule_activity_ids", [])),
+                "resolved_at": disp.get("resolved_at"),
+                "treatment_facts_at_snapshot": None if row is None else row["treatment_facts"],
+            })
         return {
             "protocol": {
                 "protocol_id": proto["protocol_id"],
@@ -1655,6 +1744,7 @@ class TrialRegistry:
             "medical_decisions": decisions,
             "sae_ids": sae_ids,
             "deviation_ids": deviation_ids,
+            "amendments": amendments,
             "consent_id": subject["consent_id"],
             "enrolled_at": subject["enrolled_at"],
         }
@@ -1666,6 +1756,953 @@ class TrialRegistry:
             if subject["protocol_id"] is None:
                 raise StateConflictError("受试者尚未入组，暂无研究溯源链")
             return self._provenance_chain(subject)
+
+    # ----- 方案修订（队列扩展） ------------------------------------------
+
+    def submit_amendment(
+        self,
+        actor: dict[str, Any],
+        *,
+        protocol_id: str,
+        new_version: str,
+        summary: str,
+        impact_domains: list[str],
+        requires_reconsent: bool,
+        emergency: bool = False,
+        reason: str = "",
+        review_deadline_hours: Optional[int] = None,
+        amendment_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """提交方案修订。
+
+        修订必须声明受影响的范围（剂量/器械/观察窗口/安全规则）以及是否需要
+        重新知情同意。安全角色批准后才生成逐受试者影响快照。
+
+        紧急安全修订（emergency=True）允许"先冻结再补审"：提交即对受影响
+        在组受试者生效冻结，但必须给出紧急理由与补审期限（不超过
+        EMERGENCY_REVIEW_DEADLINE_MAX_HOURS 小时），二者缺一不可。
+        """
+        actor = self._actor(actor)
+        self._require_role(actor, "研究者", "试验协调员")
+        new_version = str(new_version).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", new_version):
+            raise ValidationError("方案版本号只允许字母数字及 . _ -")
+        domains: list[str] = []
+        for d in impact_domains or []:
+            if d not in IMPACT_DOMAINS:
+                raise ValidationError(f"未知影响域：{d}；允许：{'、'.join(IMPACT_DOMAINS)}")
+            if d not in domains:
+                domains.append(d)
+        if not domains:
+            raise ValidationError("修订必须声明至少一个受影响范围（剂量/器械/观察窗口/安全规则）")
+        if not str(summary).strip():
+            raise ValidationError("修订必须填写变更摘要")
+        is_emergency = bool(emergency)
+        if is_emergency:
+            if not str(reason).strip():
+                raise ValidationError("紧急安全修订必须写明紧急理由", )
+            if review_deadline_hours is None:
+                raise ValidationError("紧急安全修订必须给出补审期限")
+            hours = int(review_deadline_hours)
+            if hours <= 0 or hours > EMERGENCY_REVIEW_DEADLINE_MAX_HOURS:
+                raise ValidationError(
+                    f"补审期限必须为 1~{EMERGENCY_REVIEW_DEADLINE_MAX_HOURS} 小时的正整数"
+                )
+        elif review_deadline_hours is not None:
+            raise ValidationError("仅紧急安全修订可设置补审期限")
+        with self._lock:
+            base = self._get(self.protocols, "方案", protocol_id)
+            for proto in self.protocols.values():
+                if proto["version"] == new_version:
+                    raise StateConflictError(f"方案版本已存在：{new_version}",
+                                             code="duplicate_protocol")
+            # 新版本方案在批准时才创建；此处先防止两份在途修订抢占同一版本号
+            for other_id in self.amendment_order:
+                other = self.amendments[other_id]
+                if (other["new_version"] == new_version
+                        and other["status"] not in ("已驳回", "已撤销")):
+                    raise StateConflictError(
+                        f"已有在途修订 {other_id} 声明新版本 {new_version}",
+                        code="duplicate_protocol")
+            aid = amendment_id or _new_id("amd")
+            if aid in self.amendments:
+                raise StateConflictError(f"修订已存在：{aid}", code="duplicate_amendment")
+            now = self._now()
+            record = {
+                "amendment_id": aid,
+                "kind": "紧急安全修订" if is_emergency else "常规修订",
+                "base_protocol_id": base["protocol_id"],
+                "base_version": base["version"],
+                "new_version": new_version,
+                "summary": summary,
+                "impact_domains": domains,
+                "requires_reconsent": bool(requires_reconsent),
+                "status": "待安全委员会批准",
+                "submitted_by": actor["id"],
+                "submitted_at": now.isoformat(timespec="seconds"),
+                "review": None,
+                "impact_snapshot": None,
+                "snapshot_generated_at": None,
+                "emergency": {
+                    "active": is_emergency,
+                    "reason": str(reason).strip(),
+                    "review_deadline_hours": int(review_deadline_hours) if is_emergency else None,
+                    "review_due_at": (
+                        (now + timedelta(hours=hours)).isoformat(timespec="seconds")
+                        if is_emergency else None
+                    ),
+                    "review_status": "待补审" if is_emergency else None,
+                    "retro_review": None,
+                    "froze_at": now.isoformat(timespec="seconds") if is_emergency else None,
+                },
+            }
+            self.amendments[aid] = record
+            self.amendment_order.append(aid)
+            self.site_adoptions[aid] = {}
+            self._audit_log(actor, "submit_amendment", "amendment", aid,
+                            {"base_version": base["version"],
+                             "new_version": new_version, "kind": record["kind"],
+                             "impact_domains": domains,
+                             "requires_reconsent": bool(requires_reconsent)})
+            # 紧急安全修订：先冻结——立即生成影响快照、逐受试者处置与各中心待办，
+            # 并冻结受影响在组受试者的后续研究操作，等待安全委员会补审。
+            if is_emergency:
+                self._generate_impact_snapshot(record, now)
+                self._seed_adoptions_and_subjects(record, now, frozen=True)
+            return self._snapshot(record)
+
+    def review_amendment(
+        self,
+        actor: dict[str, Any],
+        *,
+        amendment_id: str,
+        approved: bool,
+        rationale: str,
+        new_protocol_params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """安全角色批准/驳回修订。批准后生成逐受试者影响快照并创建中心待办；
+        紧急安全修订调用本接口完成"补审"。
+
+        批准常规修订时应通过 new_protocol_params 提供新版本方案参数
+        （observation_days / drug_to_light 等），系统据此创建已放行的新版本方案。
+        """
+        actor = self._actor(actor)
+        self._require_role(actor, "安全委员会")
+        if not str(rationale).strip():
+            raise ValidationError("修订批准/驳回必须写明理由")
+        with self._lock:
+            record = self._get(self.amendments, "修订", amendment_id)
+            if record["status"] not in ("待安全委员会批准",):
+                raise StateConflictError(
+                    f"修订状态为 {record['status']}，安全委员会只能复核待批准修订"
+                )
+            now = self._now()
+            review = {
+                "approved": bool(approved),
+                "rationale": rationale,
+                "reviewed_by": actor["id"],
+                "at": now.isoformat(timespec="seconds"),
+            }
+            record["review"] = review
+            if not approved:
+                record["status"] = "已驳回"
+                if record["emergency"]["active"]:
+                    # 紧急修订被驳回：解除冻结，关闭派生待办/处置
+                    self._lift_emergency_freeze(record, now)
+                self._audit_log(actor, "review_amendment", "amendment", amendment_id,
+                                {"approved": False})
+                return self._snapshot(record)
+
+            # 批准：常规修订此刻生成快照与待办；紧急修订补审即确认并解除冻结标记
+            if record["kind"] == "常规修订":
+                self._create_new_protocol(record, new_protocol_params or {}, now)
+                self._generate_impact_snapshot(record, now)
+                self._seed_adoptions_and_subjects(record, now, frozen=False)
+            else:
+                self._create_new_protocol(record, new_protocol_params or {}, now)
+                em = record["emergency"]
+                overdue = now > _parse_dt(em["review_due_at"])
+                em["review_status"] = "已逾期" if overdue else "已补审"
+                em["retro_review"] = review
+                # 冻结期已提前采用的中心，补授新版本资质
+                new_version = record["new_version"]
+                for ad in self.site_adoptions.get(record["amendment_id"], {}).values():
+                    site = self.sites.get(ad["site_id"])
+                    if site is not None and new_version not in site["qualified_versions"]:
+                        site["qualified_versions"].append(new_version)
+                self._lift_emergency_freeze(record, now, approved=True)
+            record["status"] = "已批准"
+            self.decisions.append(
+                {"scope": "amendment", "target_id": amendment_id,
+                 "decision": "继续", **review}
+            )
+            self._audit_log(actor, "review_amendment", "amendment", amendment_id,
+                            {"approved": True, "kind": record["kind"]})
+            return self._snapshot(record)
+
+    def _create_new_protocol(
+        self, amendment: dict[str, Any], params: dict[str, Any], now: datetime
+    ) -> dict[str, Any]:
+        """按修订创建新版本方案记录（已批准修订直接为已放行状态）。"""
+        for proto in self.protocols.values():
+            if proto["version"] == amendment["new_version"]:
+                return proto
+        base = self.protocols[amendment["base_protocol_id"]]
+        pid = _new_id("proto")
+        observation_days = int(params.get("observation_days", base["observation_days"]))
+        resect_days = int(params.get("resect_assessment_days",
+                                     base["resect_assessment_days"]))
+        d2l = params.get("drug_to_light") or {}
+        record = {
+            "protocol_id": pid,
+            "version": amendment["new_version"],
+            "based_on": base["protocol_id"],
+            "status": "已放行",
+            "observation_days": observation_days,
+            "resect_assessment_days": resect_days,
+            "drug_to_light": {
+                "min_minutes": int(d2l.get("min_minutes",
+                                           base["drug_to_light"]["min_minutes"])),
+                "max_minutes": int(d2l.get("max_minutes",
+                                           base["drug_to_light"]["max_minutes"])),
+            },
+            "notes": f"由修订 {amendment['amendment_id']} 自 {base['version']} 升级",
+            "approval": {
+                "decision": "继续",
+                "rationale": amendment["review"]["rationale"],
+                "committee_actor_id": amendment["review"]["reviewed_by"],
+                "at": amendment["review"]["at"],
+            },
+            "created_at": now.isoformat(timespec="seconds"),
+            "introduced_by_amendment": amendment["amendment_id"],
+        }
+        self.protocols[pid] = record
+        self.protocol_order.append(pid)
+        amendment["new_protocol_id"] = pid
+        return record
+
+    def _generate_impact_snapshot(
+        self, amendment: dict[str, Any], now: datetime
+    ) -> dict[str, Any]:
+        """基于已经发生的治疗事实，逐受试者生成影响快照。
+
+        快照在批准（或紧急冻结）时刻一次性确定，此后不再随状态变化，保证
+        不同中心采用顺序、请求到达顺序都不会改变每名受试者的判定。
+        """
+        base_pid = amendment["base_protocol_id"]
+        subjects = []
+        for sid in sorted(self.subjects):
+            s = self.subjects[sid]
+            if s["protocol_id"] != base_pid:
+                continue
+            # 只影响仍在组（未撤回）且已入组者；撤回者由撤回规则优先处理，不入快照
+            if s["status"] == "筛选中" or s["withdrawn"]:
+                continue
+            facts = self._treatment_facts(s)
+            recommendation, reasons, reqs = self._recommend_disposition(
+                amendment, s, facts
+            )
+            subjects.append({
+                "subject_id": sid,
+                "site_id": s["site_id"],
+                "status_at_snapshot": s["status"],
+                "consent_version_at_snapshot": (
+                    self.consents.get(s["consent_id"] or {}, {}).get("consent_version")
+                ),
+                "treatment_facts": facts,
+                "recommendation": recommendation,
+                "recommendation_reasons": reasons,
+                "requirements": reqs,
+            })
+        snapshot = {
+            "amendment_id": amendment["amendment_id"],
+            "base_protocol_id": base_pid,
+            "base_version": amendment["base_version"],
+            "new_version": amendment["new_version"],
+            "generated_at": now.isoformat(timespec="seconds"),
+            "impact_domains": list(amendment["impact_domains"]),
+            "requires_reconsent": amendment["requires_reconsent"],
+            "emergency_active": amendment["emergency"]["active"],
+            "subjects": subjects,
+        }
+        amendment["impact_snapshot"] = snapshot
+        amendment["snapshot_generated_at"] = snapshot["generated_at"]
+        return snapshot
+
+    def _treatment_facts(self, subject: dict[str, Any]) -> dict[str, Any]:
+        """汇总受试者已经发生的治疗事实（注射/照光、剂量、器械、观察窗）。"""
+        sid = subject["subject_id"]
+        injections = [a for a in self.activities.values()
+                      if a["subject_id"] == sid and a["kind"] == "注射"
+                      and a["outcome"] == "按计划完成"]
+        lights = [a for a in self.activities.values()
+                  if a["subject_id"] == sid and a["kind"] == "激光照射"
+                  and a["outcome"] == "按计划完成"]
+        swaps = [a for a in self.activities.values()
+                 if a["subject_id"] == sid and a["outcome"] == "器械更换"]
+        return {
+            "injection_completed": bool(injections),
+            "light_completed": bool(lights),
+            "injection_count": len(injections),
+            "light_count": len(lights),
+            "device_swap_count": len(swaps),
+            "drug_lot_ids": sorted({a["lot_id"] for a in injections if a["lot_id"]}),
+            "device_lot_ids": sorted({a["device_lot_id"] for a in lights
+                                      if a["device_lot_id"]}),
+            "last_treatment_at": max(
+                [a["actual_at"] for a in injections + lights if a["actual_at"]],
+                default=None,
+            ),
+            "window_open": subject.get("window") is not None,
+            "window": self._snapshot(subject["window"]) if subject.get("window") else None,
+            "in_observation": (
+                subject.get("status") in ("观察中", "可评估")
+                or subject.get("window") is not None
+            ),
+        }
+
+    def _recommend_disposition(
+        self,
+        amendment: dict[str, Any],
+        subject: dict[str, Any],
+        facts: dict[str, Any],
+    ) -> tuple[str, list[str], list[str]]:
+        """根据已发生治疗事实给出处置建议与必须完成的要求。确定性，无外部状态。"""
+        domains = amendment["impact_domains"]
+        reasons: list[str] = []
+        reqs: list[str] = []
+
+        if facts["light_completed"]:
+            # 照光已完成：治疗事实不可改变
+            if "观察窗口" in domains and facts["window_open"]:
+                recommendation = "退出"
+                reasons.append("观察窗口规则已变更且受试者已完成照光、观察窗已开启，"
+                               "无法按新窗口重算，建议退出研究随访")
+                return recommendation, reasons, reqs
+            recommendation = "继续"
+            if "剂量" in domains:
+                reasons.append("剂量规则变更，但实际给药与照光均已完成，治疗事实不可变更")
+            if "器械" in domains:
+                reasons.append("器械规则变更，但照光已完成，仅需沿用新安全规则随访")
+            if "安全规则" in domains:
+                reasons.append("安全规则变更，按新规则继续随访")
+            if amendment["requires_reconsent"]:
+                recommendation = "补充同意"
+                reqs.append("重新签署同意")
+                reasons.append("修订要求重新知情同意")
+            else:
+                reasons.append("无需重新同意，可继续")
+            return recommendation, reasons, reqs
+
+        if facts["injection_completed"] and not facts["light_completed"]:
+            # 已给药未照光
+            recommendation = "重新排程"
+            reqs.append("重新排程")
+            reasons.append("已完成药物注射但尚未照光，后续照光须按修订后方案重新排程")
+            if "剂量" in domains:
+                reasons.append("剂量规则变更影响待执行的照光剂量")
+            if "器械" in domains or facts["device_swap_count"]:
+                reasons.append("器械规则变更，重排时须核验合格器械批次")
+            if amendment["requires_reconsent"]:
+                recommendation = "补充同意"
+                reqs.insert(0, "重新签署同意")
+                reasons.append("修订要求重新知情同意")
+            return recommendation, reasons, reqs
+
+        # 尚未治疗
+        recommendation = "继续"
+        reasons.append("尚未发生治疗事实，按新版本继续即可")
+        if amendment["requires_reconsent"]:
+            recommendation = "补充同意"
+            reqs.append("重新签署同意")
+            reasons.append("修订要求重新知情同意")
+        return recommendation, reasons, reqs
+
+    def _seed_adoptions_and_subjects(
+        self, amendment: dict[str, Any], now: datetime, *, frozen: bool
+    ) -> None:
+        """快照生成后：为每个涉及中心建立采用待办，为每名受试者建立处置待办。"""
+        snapshot = amendment["impact_snapshot"]
+        site_ids: list[str] = []
+        for row in snapshot["subjects"]:
+            if row["site_id"] not in site_ids:
+                site_ids.append(row["site_id"])
+        for site_id in site_ids:
+            adoption = {
+                "amendment_id": amendment["amendment_id"],
+                "site_id": site_id,
+                "status": "待采用",
+                "adopted_at": None,
+                "adopted_by": None,
+                "note": "",
+                "frozen_pending_adoption": frozen,
+            }
+            self.site_adoptions[amendment["amendment_id"]][site_id] = adoption
+            self._add_todo(
+                kind="中心采用修订", amendment_id=amendment["amendment_id"],
+                site_id=site_id, subject_id=None,
+                title=f"中心 {site_id} 需采用修订 {amendment['amendment_id']}"
+                      f"（{amendment['base_version']} → {amendment['new_version']}）",
+                created_at=now, emergency=frozen,
+                requirement=None,
+            )
+        for row in snapshot["subjects"]:
+            disp = {
+                "amendment_id": amendment["amendment_id"],
+                "subject_id": row["subject_id"],
+                "site_id": row["site_id"],
+                "recommendation": row["recommendation"],
+                "decision": None,
+                "requirements": list(row["requirements"]),
+                "requirements_status": {r: "待完成" for r in row["requirements"]},
+                "status": "冻结待处置" if frozen else "待处置",
+                "resolved_at": None,
+                "resolved_by": None,
+                "frozen": frozen,
+                "reconsent_id": None,
+                "reschedule_activity_ids": [],
+                "note": "",
+            }
+            self.subject_dispositions[(amendment["amendment_id"], row["subject_id"])] = disp
+            self._add_todo(
+                kind="受试者修订处置", amendment_id=amendment["amendment_id"],
+                site_id=row["site_id"], subject_id=row["subject_id"],
+                title=f"受试者 {row['subject_id']} 修订处置：建议{row['recommendation']}",
+                created_at=now, emergency=frozen,
+                requirement=("重新签署同意" if "重新签署同意" in row["requirements"]
+                             else ("重新排程" if row["requirements"] else None)),
+            )
+
+    def _add_todo(
+        self, *, kind: str, amendment_id: str, site_id: str,
+        subject_id: Optional[str], title: str, created_at: datetime,
+        emergency: bool, requirement: Optional[str],
+    ) -> str:
+        tid = _new_id("todo")
+        record = {
+            "todo_id": tid,
+            "kind": kind,
+            "amendment_id": amendment_id,
+            "site_id": site_id,
+            "subject_id": subject_id,
+            "title": title,
+            "status": "待处理",
+            "requirement": requirement,
+            "emergency": emergency,
+            "created_at": created_at.isoformat(timespec="seconds"),
+            "closed_at": None,
+            "closed_by": None,
+        }
+        self.todos[tid] = record
+        self.todo_order.append(tid)
+        return tid
+
+    def _close_todos(self, *, amendment_id: str, site_id: str,
+                     subject_id: Optional[str], actor_id: str, at: datetime) -> None:
+        for tid, t in self.todos.items():
+            if t["amendment_id"] != amendment_id or t["site_id"] != site_id:
+                continue
+            if subject_id is not None and t["subject_id"] != subject_id:
+                continue
+            if t["status"] == "待处理":
+                t["status"] = "已处理"
+                t["closed_at"] = at.isoformat(timespec="seconds")
+                t["closed_by"] = actor_id
+
+    def _lift_emergency_freeze(
+        self, amendment: dict[str, Any], now: datetime, *, approved: bool = False
+    ) -> None:
+        """紧急修订补审/驳回后的冻结收尾。
+
+        补审批准：解除全局紧急冻结标志，但受试者在中心采用、要求闭环前仍按
+        常规修订流程保持阻断；驳回：受试者处置一律作废，完全解除阻断。
+        """
+        for disp in self.subject_dispositions.values():
+            if disp["amendment_id"] != amendment["amendment_id"]:
+                continue
+            if not approved:
+                disp["frozen"] = False
+                disp["status"] = "已撤销"
+            else:
+                disp["frozen"] = False
+                if disp["status"] == "冻结待处置":
+                    disp["status"] = "待处置"
+        for adoption in self.site_adoptions.get(amendment["amendment_id"], {}).values():
+            adoption["frozen_pending_adoption"] = False
+        if not approved:
+            # 驳回时关闭派生待办
+            for t in self.todos.values():
+                if t["amendment_id"] == amendment["amendment_id"] and t["status"] == "待处理":
+                    t["status"] = "已撤销"
+                    t["closed_at"] = now.isoformat(timespec="seconds")
+
+    def adopt_amendment(
+        self,
+        actor: dict[str, Any],
+        *,
+        amendment_id: str,
+        site_id: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """中心采用新版本修订。采用后该中心才可处置其名下受试者。
+
+        紧急安全修订在补审前即处于冻结状态；中心采用不解除受试者层面的
+        要求闭环阻断。未采用修订的中心不能按新版本开展操作。
+        """
+        actor = self._actor(actor)
+        self._require_role(actor, "研究者", "试验协调员")
+        with self._lock:
+            amendment = self._get(self.amendments, "修订", amendment_id)
+            adoptions = self.site_adoptions.get(amendment_id, {})
+            adoption = adoptions.get(site_id)
+            if adoption is None:
+                raise NotFoundError(f"修订 {amendment_id} 不涉及中心 {site_id}")
+            site = self._get(self.sites, "中心", site_id)
+            if amendment["status"] != "已批准" and not (
+                amendment["emergency"]["active"] and amendment["status"] == "待安全委员会批准"
+            ):
+                raise StateConflictError(
+                    f"修订状态为 {amendment['status']}，尚不能被中心采用",
+                    code="amendment_not_adoptable",
+                )
+            if adoption["status"] == "已采用":
+                # 幂等：并发/重复确认直接返回既有记录，结果不随请求次数改变
+                return self._snapshot(adoption)
+            if adoption["status"] == "已拒绝":
+                raise StateConflictError("该中心已拒绝采用此修订",
+                                         code="site_rejected_amendment")
+            now = self._now()
+            adoption["status"] = "已采用"
+            adoption["adopted_at"] = now.isoformat(timespec="seconds")
+            adoption["adopted_by"] = actor["id"]
+            adoption["note"] = note
+            # 中心采用新版本即视为取得该版本资质授权
+            new_pid = amendment.get("new_protocol_id")
+            if new_pid is not None:
+                new_version = amendment["new_version"]
+                if new_version not in site["qualified_versions"]:
+                    site["qualified_versions"].append(new_version)
+            self._audit_log(actor, "adopt_amendment", "site", site_id,
+                            {"amendment_id": amendment_id})
+            self._close_todos(amendment_id=amendment_id, site_id=site_id,
+                              subject_id=None, actor_id=actor["id"], at=now)
+            return self._snapshot(adoption)
+
+    def resolve_subject_amendment(
+        self,
+        actor: dict[str, Any],
+        *,
+        amendment_id: str,
+        subject_id: str,
+        decision: str,
+        reconsent: Optional[dict[str, Any]] = None,
+        reschedule: Optional[list[dict[str, Any]]] = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """逐受试者确认处置：继续 / 补充同意 / 重新排程 / 退出。
+
+        - 中心必须已采用修订；
+        - 选择"补充同意"必须随附重新签署的同意记录；选择"重新排程"必须随附
+          重排后的活动；要求未闭环前该受试者的后续操作保持阻断；
+        - 决策可收窄（补充同意/重新排程在补齐要求后以最终决策闭环），但
+          重复确认幂等，结果不因并发请求顺序改变。
+        """
+        actor = self._actor(actor)
+        self._require_role(actor, "研究者", "试验协调员")
+        if decision not in SUBJECT_DISPOSITIONS:
+            raise ValidationError(f"处置必须是：{'、'.join(SUBJECT_DISPOSITIONS)}")
+        with self._lock:
+            amendment = self._get(self.amendments, "修订", amendment_id)
+            subject = self._get(self.subjects, "受试者", subject_id)
+            disp = self.subject_dispositions.get((amendment_id, subject_id))
+            if disp is None:
+                raise NotFoundError("影响快照中不存在该受试者的修订处置记录")
+            if disp["status"] in ("已完成", "已撤销"):
+                # 幂等返回（含紧急修订被驳回后的撤销态）
+                return self._snapshot(disp)
+            adoption = self.site_adoptions[amendment_id].get(disp["site_id"])
+            if adoption is None or adoption["status"] != "已采用":
+                raise StateConflictError(
+                    f"中心 {disp['site_id']} 尚未采用修订 {amendment_id}，"
+                    "不能处置受试者",
+                    code="site_amendment_not_adopted",
+                )
+
+            # 紧急安全修订：补审批准前只允许冻结，不允许逐受试者处置闭环
+            if amendment["emergency"]["active"] and amendment["status"] != "已批准":
+                raise StateConflictError(
+                    "紧急安全修订尚待安全委员会补审，补审批准前不得处置受试者",
+                    code="emergency_amendment_pending_review",
+                )
+
+            snapshot_row = self._snapshot_row(amendment, subject_id)
+            now = self._now()
+
+            # 撤回同意与未关闭 SAE 始终优先：禁止任何"继续治疗"类处置
+            if subject["withdrawn"]:
+                if decision != "退出":
+                    raise StateConflictError(
+                        "受试者已撤回同意，修订处置只能为退出（安全记录依规保留）",
+                        code="subject_withdrawn",
+                    )
+                self._close_disposition(disp, decision, actor, now, note)
+                return self._snapshot(disp)
+            if self._open_sae(subject_id) is not None:
+                raise StateConflictError(
+                    "存在未关闭（未复核）的严重不良事件，须先经安全委员会复核，"
+                    "再进行修订处置",
+                    code="sae_hold",
+                )
+
+            recommendation = snapshot_row["recommendation"]
+            # 决策不得比快照建议更"激进"：照光已完成者不可重新排程，
+            # 已给药未照光者不可跳过重新排程直接继续（除非补充同意且仍重排）
+            self._validate_disposition_decision(amendment, snapshot_row, decision)
+
+            # 处理重新签署同意
+            if reconsent is not None:
+                if "重新签署同意" not in disp["requirements"]:
+                    raise ValidationError("该受试者的修订处置不要求重新签署同意")
+                consent = self._ingest_reconsent(actor, subject, amendment, reconsent)
+                disp["reconsent_id"] = consent["consent_id"]
+                disp["requirements_status"]["重新签署同意"] = "已完成"
+
+            # 处理重新排程
+            if reschedule is not None:
+                if "重新排程" not in disp["requirements"]:
+                    raise ValidationError("该受试者的修订处置不要求重新排程")
+                ids = self._ingest_reschedule(actor, subject, amendment, reschedule)
+                disp["reschedule_activity_ids"] = ids
+                disp["requirements_status"]["重新排程"] = "已完成"
+
+            disp["decision"] = decision
+            disp["note"] = note
+
+            pending = [r for r, st in disp["requirements_status"].items()
+                       if st != "已完成"]
+            if decision in DISPOSITION_PENDING and pending:
+                disp["status"] = "待完成要求"
+                self._audit_log(actor, "resolve_subject_amendment", "subject",
+                                subject_id, {"amendment_id": amendment_id,
+                                             "decision": decision,
+                                             "pending_requirements": pending})
+                return self._snapshot(disp)
+
+            # 要求闭环（或无要求）：完成处置
+            if decision in DISPOSITION_PENDING and not pending:
+                # 补充同意 / 重新排程完成后，受试者回归新版本继续随访
+                final_decision = "继续"
+            else:
+                final_decision = decision
+            self._close_disposition(disp, final_decision, actor, now, note,
+                                    chosen=decision)
+            if final_decision == "继续" and not subject["withdrawn"]:
+                # 将受试者绑定到新版本方案（队列归属等治疗事实保持不变）
+                new_pid = amendment.get("new_protocol_id")
+                if new_pid:
+                    subject["protocol_id"] = new_pid
+                    subject["protocol_version"] = amendment["new_version"]
+            return self._snapshot(disp)
+
+    def _ingest_reconsent(
+        self, actor: dict[str, Any], subject: dict[str, Any],
+        amendment: dict[str, Any], payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if subject["withdrawn"]:
+            raise StateConflictError("受试者已撤回，不能登记新同意",
+                                     code="subject_withdrawn")
+        new_pid = amendment.get("new_protocol_id")
+        protocol_version = amendment["new_version"]
+        if new_pid is None:
+            # 紧急冻结先于新版本方案创建：按版本号反查应失败，故此处仅在补审后允许
+            raise StateConflictError("新版本方案尚未建立，不能登记新同意",
+                                     code="amendment_not_adoptable")
+        consent = self.record_consent(
+            actor,
+            subject_id=subject["subject_id"],
+            protocol_version=protocol_version,
+            signed_at=payload["signed_at"],
+            consent_version=payload["consent_version"],
+            document_ref=payload["document_ref"],
+            document_checksum=payload["document_checksum"],
+            consent_id=payload.get("consent_id"),
+        )
+        return consent
+
+    def _ingest_reschedule(
+        self, actor: dict[str, Any], subject: dict[str, Any],
+        amendment: dict[str, Any], items: list[dict[str, Any]],
+    ) -> list[str]:
+        if not items:
+            raise ValidationError("重新排程必须提供至少一个活动")
+        new_pid = amendment.get("new_protocol_id")
+        if new_pid is None:
+            raise StateConflictError("新版本方案尚未建立，不能重新排程",
+                                     code="amendment_not_adoptable")
+        old_pid = subject["protocol_id"]
+        ids: list[str] = []
+        # 处置期间受试者仍绑定旧版本；仅在内部排程时临时指向新版本以过闸，
+        # 排程后立即恢复，待处置闭环再正式改绑，避免绕过修订阻断。
+        subject["protocol_id"] = new_pid
+        subject["protocol_version"] = amendment["new_version"]
+        try:
+            for item in items:
+                kind = item["kind"]
+                if kind not in VISIT_KINDS:
+                    raise ValidationError(f"活动类型必须是：{'、'.join(VISIT_KINDS)}")
+                act = self._schedule_activity_core(
+                    actor, subject_id=subject["subject_id"], kind=kind,
+                    planned_at=item["planned_at"], activity_id=item.get("activity_id"),
+                    _amendment_bypass=True,
+                )
+                ids.append(act["activity_id"])
+        finally:
+            subject["protocol_id"] = old_pid
+            subject["protocol_version"] = self.protocols[old_pid]["version"]
+        return ids
+
+    def _validate_disposition_decision(
+        self, amendment: dict[str, Any], row: dict[str, Any], decision: str
+    ) -> None:
+        rec = row["recommendation"]
+        facts = row["treatment_facts"]
+        if decision == "继续":
+            if "重新排程" in row["requirements"]:
+                raise StateConflictError(
+                    "该受试者已给药未照光，必须先按新版本重新排程，不能直接继续",
+                    code="reschedule_required",
+                )
+            if "重新签署同意" in row["requirements"]:
+                raise StateConflictError(
+                    "修订要求重新知情同意，必须先补充同意，不能直接继续",
+                    code="reconsent_required",
+                )
+        if decision == "重新排程":
+            if facts["light_completed"]:
+                raise StateConflictError(
+                    "受试者已完成照光，治疗事实不可改变，不能重新排程",
+                    code="treatment_fact_locked",
+                )
+        if decision == "补充同意" and "重新签署同意" not in row["requirements"]:
+            raise ValidationError("该修订不要求重新签署同意，无需补充同意")
+        if decision == "退出":
+            return
+
+    def _close_disposition(
+        self, disp: dict[str, Any], final_decision: str,
+        actor: dict[str, Any], now: datetime, note: str, *, chosen: Optional[str] = None
+    ) -> None:
+        disp["status"] = "已完成"
+        disp["resolved_at"] = now.isoformat(timespec="seconds")
+        disp["resolved_by"] = actor["id"]
+        disp["final_decision"] = final_decision
+        disp["decision"] = chosen or final_decision
+        if note:
+            disp["note"] = note
+        if final_decision == "退出":
+            subject = self.subjects[disp["subject_id"]]
+            # 退出研究：停止新增研究用途，既有与安全记录保留
+            if not subject["withdrawn"]:
+                subject["withdrawn"] = True
+                subject["withdrawn_at"] = now.isoformat(timespec="seconds")
+                subject["research_use_blocked_after"] = now.isoformat(timespec="seconds")
+                subject["status"] = "已撤回"
+        self._close_todos(amendment_id=disp["amendment_id"], site_id=disp["site_id"],
+                          subject_id=disp["subject_id"], actor_id=actor["id"], at=now)
+        self._audit_log(actor, "resolve_subject_amendment", "subject",
+                        disp["subject_id"],
+                        {"amendment_id": disp["amendment_id"],
+                         "final_decision": final_decision})
+
+    def _snapshot_row(self, amendment: dict[str, Any], subject_id: str) -> dict[str, Any]:
+        for row in amendment["impact_snapshot"]["subjects"]:
+            if row["subject_id"] == subject_id:
+                return row
+        raise NotFoundError("影响快照中不存在该受试者")
+
+    # ----- 修订阻断闸门 --------------------------------------------------
+
+    def _active_amendment_block(self, subject: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """返回当前阻断该受试者研究操作的未闭环修订处置（最高优先级一条）。
+
+        优先级：紧急安全修订冻结 > 常规修订待处置；同类中较新的修订优先。
+        撤回/SAE 由各业务闸门先行处理，始终优先于修订阻断。
+        """
+        sid = subject["subject_id"]
+        best: Optional[dict[str, Any]] = None
+        for aid in reversed(self.amendment_order):
+            amendment = self.amendments[aid]
+            if amendment["status"] == "已驳回" or amendment["status"] == "已撤销":
+                continue
+            disp = self.subject_dispositions.get((aid, sid))
+            if disp is None or disp["status"] in ("已完成", "已撤销"):
+                continue
+            if disp["frozen"]:
+                return {"amendment": amendment, "disposition": disp, "emergency": True}
+            if best is None:
+                best = {"amendment": amendment, "disposition": disp, "emergency": False}
+        return best
+
+    def _amendment_gate(self, subject: dict[str, Any]) -> None:
+        """研究操作（排程/执行/采集/结局）的修订阻断校验。"""
+        block = self._active_amendment_block(subject)
+        if block is None:
+            return
+        amendment = block["amendment"]
+        disp = block["disposition"]
+        if block["emergency"]:
+            raise StateConflictError(
+                f"紧急安全修订 {amendment['amendment_id']} 已冻结该受试者，"
+                "须等待安全委员会补审并完成修订处置",
+                code="emergency_amendment_freeze",
+            )
+        pending = [r for r, st in disp["requirements_status"].items()
+                   if st != "已完成"]
+        req_text = "、".join(pending) if pending else "中心采用与受试者处置"
+        raise StateConflictError(
+            f"方案修订 {amendment['amendment_id']}（{amendment['base_version']} → "
+            f"{amendment['new_version']}）尚未闭环：{req_text}；"
+            "完成前阻断对应研究操作",
+            code="amendment_requirements_open",
+        )
+
+    def emergency_amendment_overdue(self, amendment_id: str) -> dict[str, Any]:
+        """推进紧急修订期限：超过补审期限仍未补审则标记逾期（供定时任务/查询调用）。"""
+        with self._lock:
+            amendment = self._get(self.amendments, "修订", amendment_id)
+            em = amendment["emergency"]
+            if not em["active"]:
+                raise StateConflictError("该修订不是紧急安全修订")
+            if em["retro_review"] is None and self._now() > _parse_dt(em["review_due_at"]):
+                em["review_status"] = "已逾期"
+            return self._snapshot(amendment)
+
+    # ----- 修订视图与待办 -----------------------------------------------
+
+    def list_amendments(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
+        actor = self._actor(actor)
+        if actor["role"] == "盲态评价者":
+            raise PermissionDeniedError("盲态角色不得接触方案修订（含剂量/治疗阶段信息）")
+        with self._lock:
+            return [self._snapshot(self.amendments[aid]) for aid in self.amendment_order]
+
+    def get_amendment(self, actor: dict[str, Any], amendment_id: str) -> dict[str, Any]:
+        actor = self._actor(actor)
+        if actor["role"] == "盲态评价者":
+            raise PermissionDeniedError("盲态角色不得接触方案修订（含剂量/治疗阶段信息）")
+        with self._lock:
+            return self._snapshot(self._get(self.amendments, "修订", amendment_id))
+
+    def impact_snapshot(self, actor: dict[str, Any], amendment_id: str) -> dict[str, Any]:
+        actor = self._actor(actor)
+        if actor["role"] == "盲态评价者":
+            raise PermissionDeniedError("盲态角色不得接触逐受试者影响快照")
+        with self._lock:
+            amendment = self._get(self.amendments, "修订", amendment_id)
+            if amendment["impact_snapshot"] is None:
+                raise StateConflictError("修订尚未经安全角色批准，影响快照未生成")
+            return self._snapshot(amendment["impact_snapshot"])
+
+    def pending_todos(
+        self, actor: dict[str, Any], *, site_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """各中心通过接口领取自己的待办（中心采用 + 受试者处置）。"""
+        actor = self._actor(actor)
+        if actor["role"] == "盲态评价者":
+            raise PermissionDeniedError("盲态角色不得接触修订待办（含治疗阶段信息）")
+        with self._lock:
+            rows = []
+            for tid in self.todo_order:
+                t = self.todos[tid]
+                if site_id and t["site_id"] != site_id:
+                    continue
+                if status and t["status"] != status:
+                    continue
+                rows.append(self._snapshot(t))
+            return rows
+
+    def subject_available_actions(
+        self, actor: dict[str, Any], subject_id: str
+    ) -> dict[str, Any]:
+        """查询受试者当前可执行/被阻断的动作（结果只取决于当前事实状态，
+        不取决于请求到达顺序）。盲态角色只能看到收窄后的阻断状态，
+        看不到剂量/队列/治疗时间线。"""
+        actor = self._actor(actor)
+        with self._lock:
+            subject = self._get(self.subjects, "受试者", subject_id)
+            blocked: list[dict[str, Any]] = []
+            allowed: list[str] = []
+
+            # 最高优先级：撤回
+            if subject["withdrawn"]:
+                blocked.append({"code": "subject_withdrawn",
+                                "message": "受试者已撤回，停止新增研究用途；安全记录保留",
+                                "blocks": ["schedule", "perform", "artifact", "outcome",
+                                           "enroll", "amendment_continue"]})
+            # 未关闭 SAE
+            open_sae = self._open_sae(subject_id)
+            if open_sae:
+                blocked.append({"code": "sae_hold",
+                                "message": f"未复核 SAE {open_sae['sae_id']}，治疗冻结",
+                                "blocks": ["schedule_treatment", "perform_treatment"]})
+
+            # 修订阻断
+            amd_block = None if subject["withdrawn"] else self._active_amendment_block(subject)
+            if amd_block is not None:
+                amendment = amd_block["amendment"]
+                disp = amd_block["disposition"]
+                pending = [r for r, st in disp["requirements_status"].items()
+                           if st != "已完成"]
+                blocked.append({
+                    "code": ("emergency_amendment_freeze" if amd_block["emergency"]
+                             else "amendment_requirements_open"),
+                    "amendment_id": amendment["amendment_id"],
+                    "base_version": amendment["base_version"],
+                    "new_version": amendment["new_version"],
+                    "recommendation": disp["recommendation"],
+                    "pending_requirements": pending,
+                    "site_adoption_required": (
+                        self.site_adoptions[amendment["amendment_id"]]
+                        .get(disp["site_id"], {}).get("status") != "已采用"
+                    ),
+                    "blocks": ["schedule", "perform", "artifact", "outcome"],
+                })
+
+            # 常规可执行动作（依据当前事实状态）；存在任何阻断时清空，
+            # 撤回时仅保留只读与安全报告；具体阻断原因见 blocked。
+            allowed: list[str] = ["view_subject", "report_sae"]
+            if not subject["withdrawn"]:
+                if subject["status"] == "筛选中":
+                    allowed.extend(["consent", "screen", "enroll"])
+                if subject["status"] in ("已入组", "治疗中"):
+                    allowed.append("assign_cohort")
+                if subject["cohort_id"] and subject["status"] in ("已入组", "治疗中"):
+                    allowed.extend(["schedule_treatment", "perform_treatment"])
+                if subject.get("window"):
+                    allowed.extend(["schedule_visit", "register_artifact",
+                                    "record_outcome", "set_evaluability"])
+            if blocked:
+                allowed = [a for a in allowed if a in ("view_subject", "report_sae")]
+
+            payload = {
+                "subject_id": subject_id,
+                "site_id": subject["site_id"],
+                "status": subject["status"],
+                "withdrawn": subject["withdrawn"],
+                "allowed_actions": allowed,
+                "blocked": blocked,
+                "has_open_block": bool(blocked),
+            }
+            if actor["role"] == "盲态评价者":
+                # 盲态收窄：不返回队列/剂量相关动作，仅保留状态与修订阻断事实
+                payload["allowed_actions"] = [
+                    a for a in payload["allowed_actions"]
+                    if a in ("view_subject", "register_artifact", "record_outcome")
+                ]
+                for b in blocked:
+                    b.pop("blocks", None)
+            return payload
 
     # ----- 视图与盲态红action -------------------------------------------
 

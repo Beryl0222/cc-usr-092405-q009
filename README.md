@@ -9,9 +9,11 @@
 
 - `trial.py`：纯领域模块（线程安全的内存注册中心 `TrialRegistry`），不含网络与持久化。
 - `service.py`：HTTP 入口，`GET /health` 健康检查 + `POST/GET /api/...` 受控接口。
-- `test_trial.py`：45 项领域规则测试，含六名受试者并发集成场景。
+- `test_trial.py`：领域规则测试，含六名受试者并发集成场景。
+- `test_amendment.py`：队列扩展期方案修订验收测试（多中心采用顺序、紧急期限、
+  并发确认幂等、旧版本回溯、撤回/SAE/盲态优先级）。
 - `test_api.py`：HTTP 契约测试；`service_contract.py`：健康入口回归。
-- `fixtures/domain.json`：受控词表（角色、状态、活动与结局枚举）。
+- `fixtures/domain.json`：受控词表（角色、状态、活动、结局与修订枚举）。
 
 ## 运行
 
@@ -50,6 +52,14 @@ python3 -m compileall -q .     # 编译检查全部 Python 模块
     既有记录与法规要求的安全记录（含撤回后的 SAE）保留。
 14. **溯源**：每个结局带 provenance 链——获批方案及放行决议、队列实际剂量、
     活动时间线（含器械批次与更换链接）、SAE/偏离与医学决定；另有只增的审计事件流。
+15. **队列扩展期方案修订**：修订提交时必须声明受影响的剂量/器械/观察窗口/安全规则
+    及是否需要重新同意；安全委员会批准后生成**逐受试者影响快照**（依据已发生的
+    治疗事实一次性确定，不因中心采用顺序或请求到达顺序改变）。中心先**采用**新版本
+    （自动取得该版本资质），再逐受试者处置：照光完成者通常**继续**、要求重新同意者
+    **补充同意**、已给药未照光者**重新排程**、已开启观察窗而窗口规则变更者**退出**；
+    要求未闭环前阻断该受试者对应操作。**紧急安全修订**允许先冻结再补审，但理由与
+    补审期限（≤72 小时）缺一不可，逾期标记。撤回同意、未关闭 SAE 与盲态限制始终
+    优先于修订流程。各中心通过待办接口领取本中心任务，并可查询受试者当前可执行动作。
 
 ## HTTP 接口
 
@@ -80,6 +90,26 @@ X-Actor-Role: investigator   # investigator|coordinator|dsmb|blind_reader|monito
 | artifacts | register |
 | evaluability | set |
 | outcomes | record |
+| amendments | submit / review / adopt / resolve / overdue |
 
-读接口：`GET /api/subjects[/{id}[/timeline|/provenance]]`、`GET /api/cohorts`、
+读接口：`GET /api/subjects[/{id}[/timeline|/provenance|/actions]]`、`GET /api/cohorts`、
+`GET /api/amendments[/{id}[/snapshot]]`、`GET /api/todos?site_id=...&status=...`、
 `GET /api/audit?target_type=...&target_id=...`（盲态角色自动收窄字段）。
+
+### 方案修订接口要点
+
+- `POST /api/amendments/submit`：入参 `protocol_id`（基线方案）、`new_version`、
+  `summary`、`impact_domains`（剂量/器械/观察窗口/安全规则的子集）、
+  `requires_reconsent`；紧急修订另需 `emergency=true`、`reason`、
+  `review_deadline_hours`（1–72）。紧急修订提交即冻结并立即生成快照。
+- `POST /api/amendments/review`：仅安全委员会，`approved` + `rationale`；
+  批准时可用 `new_protocol_params` 指定新版本窗口/给药照光间隔参数，
+  系统据此创建已放行的新版本方案。紧急修订以此完成补审（逾期后补审标记已逾期）。
+- `POST /api/amendments/adopt`：中心（研究者/协调员）`amendment_id` + `site_id`
+  采用新版本，重复采用幂等。
+- `POST /api/amendments/resolve`：逐受试者 `decision`（继续/补充同意/重新排程/
+  退出）；补充同意随附 `reconsent`（同 consent 字段），重新排程随附 `reschedule`
+  （活动列表，按新版本重新过窗校验）；并发/重复确认幂等。
+- `GET /api/todos?site_id=SITE-A`：中心领取本中心待办（采用修订、受试者处置）。
+- `GET /api/subjects/{id}/actions`：受试者当前可执行动作与阻断原因
+  （撤回、未关闭 SAE、修订未闭环；盲态角色自动收窄）。

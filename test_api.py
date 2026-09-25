@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import service
@@ -262,6 +263,177 @@ class ApiFlowTest(ApiTestBase):
         self.assertEqual(status, 200)
         actions = {e["action"] for e in body["data"]}
         self.assertEqual(actions, {"report_sae", "review_sae"})
+
+
+class AmendmentApiTest(ApiTestBase):
+    def _pid(self):
+        return self.r.protocol_order[0]
+
+    def test_amendment_validation_requires_impact_domains(self):
+        self.bootstrap()
+        status, body = self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "修订", "impact_domains": [], "requires_reconsent": False})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        # 只有 DSMB 可批准
+        self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "修订", "impact_domains": ["剂量", "器械"],
+            "requires_reconsent": False})
+        amd_id = list(self.r.amendments)[0]
+        status, body = self.call("/api/amendments/review", {
+            "amendment_id": amd_id, "approved": True, "rationale": "ok"})
+        self.assertEqual(status, 403)
+
+    def test_full_amendment_flow_blocks_then_unblocks_over_http(self):
+        self.bootstrap()
+        self.enroll("S1")
+        # 提交 + 批准（同时建立已放行的 2.0 方案）
+        _, body = self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "队列扩展调整", "impact_domains": ["剂量", "器械"],
+            "requires_reconsent": False})
+        amd_id = body["data"]["amendment_id"]
+        status, body = self.call("/api/amendments/review", {
+            "amendment_id": amd_id, "approved": True, "rationale": "安全数据支持",
+            "new_protocol_params": {
+                "observation_days": 21,
+                "drug_to_light": {"min_minutes": 60, "max_minutes": 300}}},
+            actor=("dsmb01", "dsmb"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["data"]["status"], "已批准")
+
+        # 影响快照
+        status, body = self.get(f"/api/amendments/{amd_id}/snapshot")
+        self.assertEqual(status, 200)
+        self.assertEqual([s["subject_id"] for s in body["data"]["subjects"]], ["S1"])
+        self.assertEqual(body["data"]["subjects"][0]["recommendation"], "继续")
+
+        # 批准后、采用/处置前：动作视图显示阻断，排程 409
+        status, body = self.get("/api/subjects/S1/actions")
+        self.assertTrue(body["data"]["has_open_block"])
+        self.assertEqual(body["data"]["blocked"][0]["code"],
+                         "amendment_requirements_open")
+        status, body = self.call("/api/activities/schedule",
+                                 {"subject_id": "S1", "kind": "注射",
+                                  "planned_at": "2026-03-03T09:00:00"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "amendment_requirements_open")
+
+        # 中心待办领取
+        status, body = self.get(
+            "/api/todos?site_id=SITE-A&status=" + quote("待处理"))
+        self.assertEqual(status, 200)
+        kinds = {t["kind"] for t in body["data"]}
+        self.assertEqual(kinds, {"中心采用修订", "受试者修订处置"})
+
+        # 未采用先处置 -> 409
+        status, body = self.call("/api/amendments/resolve",
+                                 {"amendment_id": amd_id, "subject_id": "S1",
+                                  "decision": "继续"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "site_amendment_not_adopted")
+
+        # 采用（重复调用幂等：审计只有一条）
+        for _ in range(2):
+            status, adop = self.call("/api/amendments/adopt",
+                                     {"amendment_id": amd_id, "site_id": "SITE-A"})
+            self.assertEqual(status, 200, adop)
+        # 处置（重复调用幂等）
+        for _ in range(2):
+            status, res = self.call("/api/amendments/resolve",
+                                    {"amendment_id": amd_id, "subject_id": "S1",
+                                     "decision": "继续"})
+            self.assertEqual(status, 200, res)
+        self.assertEqual(res["data"]["status"], "已完成")
+
+        # 闭环：受试者绑定 2.0，排程恢复
+        status, body = self.get("/api/subjects/S1")
+        self.assertEqual(body["data"]["protocol_version"], "2.0")
+        status, body = self.call("/api/activities/schedule",
+                                 {"subject_id": "S1", "kind": "注射",
+                                  "planned_at": "2026-03-03T09:00:00",
+                                  "activity_id": "S1-inj"})
+        self.assertEqual(status, 200, body)
+        status, body = self.get("/api/subjects/S1/actions")
+        self.assertFalse(body["data"]["has_open_block"])
+
+        # 旧版本回溯：provenance 中保留修订记录
+        status, body = self.get("/api/subjects/S1/provenance")
+        self.assertEqual(status, 200)
+        hist = body["data"]["amendments"]
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["base_version"], "1.0")
+        self.assertEqual(hist[0]["final_decision"], "继续")
+
+    def test_emergency_amendment_freeze_then_retro_review_over_http(self):
+        self.bootstrap()
+        self.enroll("S1")
+        # 紧急修订缺理由/期限 -> 400
+        status, body = self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "紧急", "impact_domains": ["安全规则"],
+            "requires_reconsent": False, "emergency": True,
+            "reason": "", "review_deadline_hours": 48})
+        self.assertEqual(status, 400)
+        # 合法提交即冻结
+        _, body = self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "紧急安全修订", "impact_domains": ["安全规则", "器械"],
+            "requires_reconsent": False, "emergency": True,
+            "reason": "出现严重器械相关信号", "review_deadline_hours": 48})
+        amd_id = body["data"]["amendment_id"]
+        self.assertEqual(body["data"]["emergency"]["review_status"], "待补审")
+        self.assertIsNotNone(body["data"]["impact_snapshot"])
+        status, body = self.call("/api/activities/schedule",
+                                 {"subject_id": "S1", "kind": "注射",
+                                  "planned_at": "2026-03-03T09:00:00"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "emergency_amendment_freeze")
+        # 补审前处置 -> 409
+        self.call("/api/amendments/adopt",
+                  {"amendment_id": amd_id, "site_id": "SITE-A"})
+        status, body = self.call("/api/amendments/resolve",
+                                 {"amendment_id": amd_id, "subject_id": "S1",
+                                  "decision": "继续"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "emergency_amendment_pending_review")
+        # DSMB 补审 -> 冻结解除，可处置
+        status, _ = self.call("/api/amendments/review", {
+            "amendment_id": amd_id, "approved": True, "rationale": "补审认可",
+            "new_protocol_params": {"observation_days": 14,
+                                    "drug_to_light": {"min_minutes": 60,
+                                                      "max_minutes": 240}}},
+            actor=("dsmb01", "dsmb"))
+        self.assertEqual(status, 200)
+        status, _ = self.call("/api/amendments/resolve",
+                              {"amendment_id": amd_id, "subject_id": "S1",
+                               "decision": "继续"})
+        self.assertEqual(status, 200)
+
+    def test_blind_role_denied_amendment_views_but_sees_narrowed_actions(self):
+        self.bootstrap()
+        self.enroll("S1")
+        self.call("/api/amendments/submit", {
+            "protocol_id": self._pid(), "new_version": "2.0",
+            "summary": "修订", "impact_domains": ["剂量"],
+            "requires_reconsent": False})
+        amd_id = list(self.r.amendments)[0]
+        self.call("/api/amendments/review",
+                  {"amendment_id": amd_id, "approved": True, "rationale": "ok"},
+                  actor=("dsmb01", "dsmb"))
+        for path in ("/api/amendments", f"/api/amendments/{amd_id}",
+                     f"/api/amendments/{amd_id}/snapshot", "/api/todos?site_id=SITE-A"):
+            status, body = self.get(path, actor=("reader01", "blind_reader"))
+            self.assertEqual(status, 403, path)
+            self.assertEqual(body["error"]["code"], "permission_denied")
+        # 动作视图对盲态可用且收窄
+        status, body = self.get("/api/subjects/S1/actions",
+                                actor=("reader01", "blind_reader"))
+        self.assertEqual(status, 200)
+        self.assertTrue(body["data"]["has_open_block"])
+        self.assertNotIn("blocks", body["data"]["blocked"][0])
 
 
 if __name__ == "__main__":
