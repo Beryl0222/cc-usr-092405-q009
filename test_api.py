@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import service
@@ -262,6 +263,159 @@ class ApiFlowTest(ApiTestBase):
         self.assertEqual(status, 200)
         actions = {e["action"] for e in body["data"]}
         self.assertEqual(actions, {"report_sae", "review_sae"})
+
+
+class AmendmentApiTest(ApiTestBase):
+    def _two_subjects_with_facts(self):
+        self.bootstrap()
+        self.enroll("A1")  # 未治疗 -> 补充同意
+        self.enroll("A2")  # 已注射待照光 -> 重新排程
+        status, _ = self.call("/api/activities/schedule",
+                              {"subject_id": "A2", "kind": "注射",
+                               "planned_at": "2026-03-03T09:00:00",
+                               "activity_id": "A2-inj"})
+        self.assertEqual(status, 200)
+        status, _ = self.call("/api/activities/perform",
+                              {"activity_id": "A2-inj",
+                               "at": "2026-03-03T09:00:00",
+                               "drug_lot_id": "DRUG-1"})
+        self.assertEqual(status, 200)
+        status, _ = self.call("/api/activities/schedule",
+                              {"subject_id": "A2", "kind": "激光照射",
+                               "planned_at": "2026-03-03T11:00:00",
+                               "activity_id": "A2-l"})
+        self.assertEqual(status, 200)
+
+    def test_amendment_lifecycle_over_http(self):
+        self._two_subjects_with_facts()
+        # 提交器械修订
+        status, body = self.call("/api/amendments/submit", {
+            "protocol_id": self.r.protocol_order[0],
+            "new_version": "1.1",
+            "impact": {"器械": {"required_device_lot": "DEV-2"}},
+            "rationale": "光纤球囊升级"})
+        self.assertEqual(status, 200, body)
+        aid = body["data"]["amendment_id"]
+        self.assertEqual(body["data"]["status"], "待复核")
+        # 协调员不能复核
+        status, body = self.call("/api/amendments/review",
+                                 {"amendment_id": aid, "decision": "批准",
+                                  "rationale": "ok"},
+                                 actor=("coord01", "coordinator"))
+        self.assertEqual(status, 403)
+        # DSMB 批准 -> 生成快照
+        status, body = self.call("/api/amendments/review",
+                                 {"amendment_id": aid, "decision": "批准",
+                                  "rationale": "风险可控，放行"},
+                                 actor=("dsmb01", "dsmb"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["data"]["status"], "已批准")
+        self.assertEqual(
+            {row["subject_id"]: row["decision"] for row in body["data"]["snapshots"]},
+            {"A1": "补充同意", "A2": "重新排程"})
+        # 快照 GET
+        status, body = self.get(f"/api/amendments/{aid}/snapshots")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["data"]), 2)
+        # 中心采用
+        status, body = self.call("/api/amendments/adopt",
+                                 {"amendment_id": aid, "site_id": "SITE-A"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(body["data"]["todo_ids"]), 2)
+        self.assertIn("1.1", self.r.sites["SITE-A"]["qualified_versions"])
+        # 采用幂等
+        status, body2 = self.call("/api/amendments/adopt",
+                                  {"amendment_id": aid, "site_id": "SITE-A"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body2["data"]["todo_ids"], body["data"]["todo_ids"])
+        # 中心领取待办
+        status, body = self.get("/api/sites/SITE-A/todos")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["data"]), 2)
+        todos = {t["subject_id"]: t for t in body["data"]}
+        # 未完成要求前操作被阻断
+        status, body = self.call("/api/activities/schedule",
+                                 {"subject_id": "A1", "kind": "访视",
+                                  "planned_at": "2026-03-10T09:00:00"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "amendment_requirement_open")
+        # 受试者可执行动作查询
+        status, body = self.get("/api/subjects/A1/actions")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["data"]["blocked"])
+        self.assertTrue(body["data"]["actions"]["amendment_reconsent"]["allowed"])
+        self.assertFalse(body["data"]["actions"]["perform_treatment"]["allowed"])
+        # A1：先补同意再完成待办
+        status, body = self.call("/api/subjects/consent", {
+            "subject_id": "A1", "protocol_version": "1.1",
+            "signed_at": "2026-03-02T12:00:00", "consent_version": "ICF-2",
+            "document_ref": "vault://icf/A1-v2",
+            "document_checksum": "sha256:a1v2",
+            "amendment_id": aid})
+        self.assertEqual(status, 200, body)
+        status, _ = self.call("/api/amendments/resolve_todo",
+                              {"todo_id": todos["A1"]["todo_id"],
+                               "resolution": "补充同意"})
+        self.assertEqual(status, 200)
+        # A2：改期后完成待办
+        status, _ = self.call("/api/activities/delay",
+                              {"activity_id": "A2-l",
+                               "new_planned_at": "2026-03-03T13:00:00",
+                               "reason": "等待新器械",
+                               "amendment_id": aid})
+        self.assertEqual(status, 200)
+        status, body = self.call("/api/amendments/resolve_todo",
+                                 {"todo_id": todos["A2"]["todo_id"],
+                                  "resolution": "重新排程"})
+        self.assertEqual(status, 200, body)
+        # 全部完成：待办列表可按状态过滤，操作恢复
+        status, body = self.get(
+            "/api/sites/SITE-A/todos?status=" + quote("待处理"))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"], [])
+        status, _ = self.call("/api/activities/schedule",
+                              {"subject_id": "A1", "kind": "访视",
+                               "planned_at": "2026-03-10T09:00:00",
+                               "activity_id": "A1-visit"})
+        self.assertEqual(status, 200)
+
+    def test_emergency_amendment_freeze_and_blind_narrowing(self):
+        self.bootstrap()
+        self.enroll("A1")
+        status, body = self.call("/api/amendments/submit", {
+            "protocol_id": self.r.protocol_order[0],
+            "new_version": "2.0",
+            "impact": {"安全规则": {"rule": "暂停暴露"}},
+            "rationale": "急性致死信号", "emergency": True,
+            "review_due_at": "2026-03-03T09:00:00"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["data"]["status"], "冻结生效中")
+        # 缺补审期限被 400 拒绝
+        status, body = self.call("/api/amendments/submit", {
+            "protocol_id": self.r.protocol_order[0],
+            "new_version": "2.1", "impact": {"安全规则": {"x": 1}},
+            "rationale": "r", "emergency": True})
+        self.assertEqual(status, 400)
+        # 冻结阻断
+        status, body = self.call("/api/activities/schedule",
+                                 {"subject_id": "A1", "kind": "注射",
+                                  "planned_at": "2026-03-03T09:00:00"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "amendment_freeze")
+        # SAE 仍可上报
+        status, _ = self.call("/api/saes/report",
+                              {"subject_id": "A1", "at": "2026-03-02T12:00:00",
+                               "description": "监测事件", "severity": "中度"})
+        self.assertEqual(status, 200)
+        # 盲态：可领收窄待办/动作，不可读修订实质
+        status, body = self.get("/api/subjects/A1/actions",
+                                actor=("reader01", "blind_reader"))
+        self.assertEqual(status, 200)
+        self.assertTrue(body["data"]["blocked"])
+        self.assertNotIn("perform_treatment", body["data"]["actions"])
+        status, body = self.get("/api/amendments",
+                                actor=("reader01", "blind_reader"))
+        self.assertEqual(status, 403)
 
 
 if __name__ == "__main__":
